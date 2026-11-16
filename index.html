@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trafic routier national 2019</title>
+
+<!-- MapLibre GL JS : la bibliothèque qui dessine la carte (chargée depuis internet) -->
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+
+<style>
+  /* La carte occupe toute la fenêtre */
+  html, body { margin: 0; height: 100%; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #map { position: absolute; inset: 0; }
+
+  /* Panneau en haut à gauche : titre, légende, sources */
+  #panneau {
+    position: absolute; top: 10px; left: 10px; z-index: 2;
+    width: 300px; max-width: calc(100vw - 20px); max-height: calc(100vh - 40px); overflow-y: auto;
+    background: rgba(255, 255, 255, 0.96); color: #222;
+    border-radius: 8px; padding: 12px 14px; box-shadow: 0 1px 6px rgba(0, 0, 0, 0.3);
+    font-size: 13px; line-height: 1.4;
+  }
+  #panneau h1 { font-size: 15px; margin: 0 0 2px; }
+  #panneau .sous-titre { margin: 0 0 10px; color: #555; }
+  .ligne-legende { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+  .trait { display: inline-block; width: 34px; border-radius: 2px; flex: none; }
+  #indice { margin: 10px 0 6px; color: #444; font-style: italic; }
+  details { margin-top: 6px; }
+  summary { cursor: pointer; font-weight: 600; }
+  details p { margin: 6px 0; font-size: 12px; color: #444; }
+  #message { color: #b00020; font-weight: 600; margin-top: 8px; }
+  .popup-route { font-weight: 700; margin-bottom: 4px; }
+  .popup-ligne { margin: 2px 0; }
+</style>
+</head>
+
+<body>
+<div id="map"></div>
+
+<aside id="panneau">
+  <h1>Trafic sur le réseau routier national</h1>
+  <p class="sous-titre">Trafic moyen journalier annuel (TMJA), données 2019</p>
+
+  <div id="legende"></div>
+  <p id="indice"></p>
+  <div id="message"></div>
+
+  <details>
+    <summary>Lecture et sources</summary>
+    <p><strong>Lecture.</strong> Le TMJA est le nombre moyen de véhicules par jour, tous véhicules confondus.
+       « PL en jour ouvré » est une estimation : TMJA × part de poids lourds corrigée, rapportée à
+       230 jours circulés par an (les poids lourds ne circulent pas le week-end ni les jours fériés).</p>
+    <p><strong>Tronçons en gris.</strong> Pas de comptage disponible (environ 20 % des tronçons), ce qui ne
+       signifie pas « pas de trafic ». Le trafic poids lourds n'est parfois pas mesuré.</p>
+    <p><strong>Limites.</strong> Données de l'année 2019, non mises à jour depuis. Carte non officielle,
+       réalisée à partir de données ouvertes.</p>
+    <p><strong>Sources.</strong> Ministère de la Transition écologique, « Trafic moyen journalier annuel sur le
+       réseau routier national » (2019), Licence Ouverte. Correction de la part de poids lourds et calcul des
+       variables PL : N. Roelandt et V. Robin (2025), Université Gustave Eiffel / Cerema,
+       <a href="https://doi.org/10.57745/9IDG31" target="_blank" rel="noopener">doi:10.57745/9IDG31</a>.
+       Fond de carte : Plan IGN © IGN.</p>
+  </details>
+</aside>
+
+<script>
+/* ==========================================================
+   RÉGLAGES (les valeurs à modifier si besoin sont ici)
+   ========================================================== */
+
+// Chemin du fichier de données, à placer à côté de cette page
+const FICHIER_DONNEES = 'data/tmja_2019.geojson';
+
+// À partir de ce niveau de zoom, les étiquettes apparaissent sur les routes
+// (plus le nombre est grand, plus il faut zoomer)
+const ZOOM_ETIQUETTES = 9;
+
+// Seuils de trafic (véhicules/jour) entre les classes.
+// 0,5 sert à isoler les tronçons sans comptage (TMJA = 0).
+const SEUILS = [0.5, 10000, 30000, 60000];
+
+// Une entrée par classe : couleur, épaisseur du trait (en pixels) et texte de la légende
+const GRIS = '#999999';
+const CLASSES = [
+  { couleur: GRIS,      largeur: 0.6, libelle: 'Pas de comptage' },
+  { couleur: '#fdae6b', largeur: 1.0, libelle: 'Moins de 10 000 véh/jour' },
+  { couleur: '#fd8d3c', largeur: 1.6, libelle: '10 000 à 30 000' },
+  { couleur: '#e6550d', largeur: 2.4, libelle: '30 000 à 60 000' },
+  { couleur: '#a63603', largeur: 3.4, libelle: 'Plus de 60 000' }
+];
+
+/* ==========================================================
+   EXPRESSIONS DE STYLE
+   MapLibre choisit la couleur et l'épaisseur de chaque tronçon
+   à partir de son TMJA, grâce aux seuils définis plus haut.
+   ========================================================== */
+
+// Valeur du champ TMJA (0 si absent)
+const TMJA = ['to-number', ['get', 'TMJA'], 0];
+
+// Construit une expression « par classe » à partir d'une liste de 5 valeurs
+function parClasse(valeurs) {
+  const expression = ['step', TMJA, valeurs[0]];
+  SEUILS.forEach((seuil, i) => expression.push(seuil, valeurs[i + 1]));
+  return expression;
+}
+
+const couleur = parClasse(CLASSES.map(c => c.couleur));
+
+// Les traits grossissent quand on zoome (x2,2 entre le zoom 5 et le zoom 12)
+const largeur = ['interpolate', ['linear'], ['zoom'],
+  5,  parClasse(CLASSES.map(c => c.largeur)),
+  12, parClasse(CLASSES.map(c => c.largeur * 2.2))
+];
+
+/* ==========================================================
+   LA CARTE
+   ========================================================== */
+
+// Plan IGN (service de la Géoplateforme, gratuit)
+const URL_PLAN_IGN =
+  'https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0' +
+  '&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&TILEMATRIXSET=PM' +
+  '&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/png';
+
+const map = new maplibregl.Map({
+  container: 'map',
+  // Vue de départ : la France métropolitaine
+  bounds: [[-5.5, 41.2], [9.8, 51.3]],
+  fitBoundsOptions: { padding: 20 },
+  maxZoom: 17,
+  style: {
+    version: 8,
+    // Source des polices utilisées pour écrire les étiquettes
+    glyphs: 'https://fonts.openmaptiles.org/{fontstack}/{range}.pbf',
+    sources: {
+      ign: {
+        type: 'raster', tiles: [URL_PLAN_IGN], tileSize: 256, maxzoom: 19,
+        attribution: 'Fond : Plan IGN © IGN'
+      },
+      // Les données de trafic : vides au départ, remplies après chargement du fichier
+      tmja: { type: 'geojson', data: { type: 'FeatureCollection', features: [] } }
+    },
+    layers: [
+      // 1. Fond de carte IGN, un peu désaturé pour que les couleurs du trafic ressortent
+      { id: 'fond', type: 'raster', source: 'ign', paint: { 'raster-saturation': -0.5 } },
+
+      // 2. Les routes, colorées et dimensionnées selon le TMJA
+      {
+        id: 'trafic', type: 'line', source: 'tmja',
+        layout: {
+          'line-cap': 'round', 'line-join': 'round',
+          'line-sort-key': TMJA            // les tronçons les plus chargés sont dessinés au-dessus
+        },
+        paint: { 'line-color': couleur, 'line-width': largeur }
+      },
+
+      // 3. Les étiquettes, posées le long des routes, visibles à partir d'un certain zoom
+      {
+        id: 'etiquettes', type: 'symbol', source: 'tmja', minzoom: ZOOM_ETIQUETTES,
+        filter: ['!=', ['get', 'etiquette'], ''],     // pas d'étiquette si pas de comptage
+        layout: {
+          'symbol-placement': 'line',
+          'symbol-spacing': 350,                       // distance entre deux répétitions (pixels)
+          'text-field': ['get', 'etiquette'],
+          'text-font': ['Open Sans Regular'],
+          'text-size': 11,
+          'text-max-angle': 30
+        },
+        paint: {
+          'text-color': '#222222',
+          'text-halo-color': '#ffffff',               // halo blanc pour rester lisible
+          'text-halo-width': 1.6
+        }
+      }
+    ]
+  }
+});
+
+map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
+map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
+
+/* ==========================================================
+   CHARGEMENT ET PRÉPARATION DES DONNÉES
+   ========================================================== */
+
+// Met un espace insécable comme séparateur de milliers : 25340 -> « 25 340 »
+const formatNombre = new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 0 });
+function fmt(n) {
+  return formatNombre.format(Math.round(n)).replace(/[  ]/g, ' ');
+}
+
+// Ajoute à chaque tronçon le texte de l'étiquette sur deux lignes
+function preparer(donnees) {
+  donnees.features.forEach(f => {
+    const p = f.properties || (f.properties = {});
+    const t = Number(p.TMJA) || 0;
+    const pl = Number(p.trafic_pl_ouvre) || 0;
+    if (t > 0) {
+      p.etiquette = 'TMJA : ' + fmt(t) + ' véh/jour' +
+                    (pl > 0 ? '\ndont ' + fmt(pl) + ' PL en jour ouvré' : '');
+    } else {
+      p.etiquette = '';
+    }
+  });
+}
+
+map.on('load', async () => {
+  try {
+    const reponse = await fetch(FICHIER_DONNEES);
+    if (!reponse.ok) throw new Error('HTTP ' + reponse.status);
+    const donnees = await reponse.json();
+    preparer(donnees);
+    map.getSource('tmja').setData(donnees);
+  } catch (erreur) {
+    document.getElementById('message').textContent =
+      'Impossible de charger le fichier de données (' + FICHIER_DONNEES + ').';
+    console.error(erreur);
+  }
+});
+
+/* ==========================================================
+   INFOBULLE AU CLIC
+   ========================================================== */
+
+function ligne(texte, classe) {
+  const div = document.createElement('div');
+  div.className = classe || 'popup-ligne';
+  div.textContent = texte;          // textContent : le texte n'est jamais interprété comme du code
+  return div;
+}
+
+function contenuPopup(p) {
+  const boite = document.createElement('div');
+  if (p.route) boite.appendChild(ligne(p.route, 'popup-route'));
+  const t = Number(p.TMJA) || 0;
+  const pl = Number(p.trafic_pl_ouvre) || 0;
+  if (t > 0) {
+    boite.appendChild(ligne('TMJA : ' + fmt(t) + ' véh/jour'));
+    boite.appendChild(ligne(pl > 0
+      ? 'Poids lourds, jour ouvré : ' + fmt(pl) + ' PL/jour'
+      : 'Trafic poids lourds non renseigné'));
+  } else {
+    boite.appendChild(ligne('Pas de comptage sur ce tronçon'));
+  }
+  return boite;
+}
+
+map.on('click', (e) => {
+  const marge = 6;   // tolérance de clic en pixels (les traits sont fins)
+  const trouves = map.queryRenderedFeatures(
+    [[e.point.x - marge, e.point.y - marge], [e.point.x + marge, e.point.y + marge]],
+    { layers: ['trafic'] }
+  );
+  if (!trouves.length) return;
+  new maplibregl.Popup({ maxWidth: '280px' })
+    .setLngLat(e.lngLat)
+    .setDOMContent(contenuPopup(trouves[0].properties))
+    .addTo(map);
+});
+
+map.on('mouseenter', 'trafic', () => { map.getCanvas().style.cursor = 'pointer'; });
+map.on('mouseleave', 'trafic', () => { map.getCanvas().style.cursor = ''; });
+
+/* ==========================================================
+   LÉGENDE ET MESSAGE D'AIDE
+   ========================================================== */
+
+const legende = document.getElementById('legende');
+// On affiche les classes de la plus chargée à la moins chargée
+CLASSES.slice().reverse().forEach(c => {
+  const div = document.createElement('div');
+  div.className = 'ligne-legende';
+  const trait = document.createElement('span');
+  trait.className = 'trait';
+  trait.style.background = c.couleur;
+  trait.style.height = Math.max(2, c.largeur * 1.5) + 'px';
+  const texte = document.createElement('span');
+  texte.textContent = c.libelle;
+  div.append(trait, texte);
+  legende.appendChild(div);
+});
+
+const indice = document.getElementById('indice');
+function majIndice() {
+  indice.textContent = map.getZoom() < ZOOM_ETIQUETTES
+    ? 'Zoomez pour afficher les valeurs sur les routes. Cliquez sur un tronçon pour le détail.'
+    : 'Cliquez sur un tronçon pour le détail.';
+}
+map.on('zoom', majIndice);
+majIndice();
+</script>
+</body>
+</html>
